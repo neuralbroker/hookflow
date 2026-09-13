@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hookflow"
+version = "0.1.0"
+description = "Reliable webhook and event delivery infrastructure"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "neuralbroker" }]
+keywords = ["webhooks", "events", "fastapi", "postgres", "redis", "reliability"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "httpx>=0.27",
+    "python-multipart>=0.0.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/neuralbroker/hookflow"
+Repository = "https://github.com/neuralbroker/hookflow"
+Issues = "https://github.com/neuralbroker/hookflow/issues"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
