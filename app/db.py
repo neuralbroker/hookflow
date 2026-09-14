@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -41,6 +41,15 @@ class Endpoint(Base):
 
 class Event(Base):
     __tablename__ = "events"
+    __table_args__ = (
+        # Idempotency keys are scoped per endpoint. The app checks for an
+        # existing row first; this constraint closes the race where two
+        # concurrent ingests with the same key would both insert.
+        # NULL keys (no dedupe requested) are exempt — SQLite and Postgres
+        # both allow multiple NULLs in a UNIQUE constraint.
+        UniqueConstraint("endpoint_id", "idempotency_key", name="uq_events_endpoint_key"),
+        Index("ix_events_endpoint_created", "endpoint_id", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     endpoint_id: Mapped[str] = mapped_column(
@@ -61,6 +70,13 @@ class Event(Base):
 
 class Delivery(Base):
     __tablename__ = "deliveries"
+    __table_args__ = (
+        # Hot path for the worker: "what is due now?" Must be indexed or
+        # every poll is a full-table scan.
+        Index("ix_deliveries_status_next", "status", "next_attempt_at"),
+        Index("ix_deliveries_endpoint_created", "endpoint_id", "created_at"),
+        Index("ix_deliveries_event", "event_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     event_id: Mapped[str] = mapped_column(

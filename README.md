@@ -26,7 +26,7 @@ Worker
 Webhook Endpoint
 ```
 
-See `docs/architecture.md`.
+See `docs/architecture.md`, `docs/database.md`, `docs/performance.md`, `docs/security.md`, `docs/deployment.md`.
 
 ## Key Engineering Decisions
 
@@ -43,13 +43,12 @@ Python · FastAPI · PostgreSQL · Redis · Docker · pytest
 ## Features
 
 1. Webhook registration with per-endpoint secret + rate limit
-2. Event ingestion with size validation
-3. Idempotency keys (body or header, per endpoint)
-4. Async signed delivery with timeout
-5. Retries with exponential backoff + DLQ
-6. Delivery history with pagination + filters
-7. Health/ready checks (DB + Redis)
-8. Docker Compose (app, worker, db, redis)
+2. Event ingestion with size validation + idempotency race protection (DB UNIQUE)
+3. Async signed delivery with timeout
+4. Retries with exponential backoff + DLQ + replay endpoint
+5. Delivery history with pagination + filters
+6. Health/ready checks (DB + Redis) + `/metrics` + `/v1/stats` + request IDs
+7. Docker Compose (app, worker, db, redis)
 
 ## Running Locally
 
@@ -67,19 +66,29 @@ Verify a receiver sees `X-Hookflow-Signature: sha256=...` computed over the raw 
 ## Testing
 
 ```bash
-python -m pytest -q
+python -m pytest -q   # 17 tests: API, worker, HMAC, backoff, replay/stats/metrics
+python scripts/load_test.py --events 500 --payload-kb 1
 ```
 
 Isolated SQLite per test; Redis not required (memory fallback); worker HTTP mocked with `httpx.MockTransport`.
 
 ## Performance
 
-No published benchmarks yet. Measure before citing: sustained ingest RPS, delivery success rate, p95 ingest + delivery latency, worker throughput, Redis hit behavior.
+Measured 2026-09-14 via `scripts/load_test.py` (TestClient + SQLite, single process):
+
+- 500 events × 1KB: **38.6 rps, p50 25.5ms, p95 28.8ms**
+- 200 events × 10KB: **37.7 rps, p50 25.8ms, p95 29.0ms**
+
+Cost is the transaction, not payload size at these sizes. See `docs/performance.md`.
+Postgres + concurrent + worker-delivery numbers not yet measured — do not cite them.
 
 ## Limitations
 
-Memory fallback is single-replica only; no multi-tenant auth (endpoint secrets only); no replay API for DLQ yet (requeue by resetting status); no Prometheus metrics yet; backoff schedule fixed via config.
+Memory fallback is single-replica only; no multi-tenant auth (endpoint secrets only);
+backoff schedule fixed via config; `create_all` instead of Alembic (see `docs/database.md`);
+secrets stored plaintext; no TLS in Compose (terminate at LB).
 
 ## Future Improvements
 
-DLQ replay endpoint, Prometheus metrics + Grafana, per-tenant API keys, Alembic migrations, load-test script, hosted demo.
+Per-tenant API keys, Alembic migrations, k6 concurrent + worker-throughput benchmarks,
+Grafana dashboard, hosted demo.

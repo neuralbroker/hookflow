@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import logging
+import time
+import uuid
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from sqlalchemy import create_engine
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from sqlalchemy import create_engine, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import Settings, get_settings
@@ -26,6 +29,20 @@ rate_limiter = RateLimiter()
 delivery_queue = DeliveryQueue()
 engine = None
 SessionLocal = None
+
+logger = logging.getLogger("hookflow")
+
+# Lightweight in-process counters (also exposed as Prometheus text at /metrics).
+# Keeps the dependency set small: no prometheus_client required.
+_counters: dict[str, int] = {
+    "events_ingested_total": 0,
+    "events_deduplicated_total": 0,
+    "deliveries_requeued_total": 0,
+}
+
+
+def _bump(counter: str) -> None:
+    _counters[counter] = _counters.get(counter, 0) + 1
 
 
 def get_settings_dep() -> Settings:
@@ -77,9 +94,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     init_state(settings or get_settings())
     app = FastAPI(title="HookFlow", version="0.1.0")
 
+    @app.middleware("http")
+    async def request_id_middleware(request: Request, call_next):
+        """Attach a request ID for log correlation. Honors incoming X-Request-ID."""
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception("request_failed", extra={"request_id": request_id})
+            raise
+        latency_ms = int((time.monotonic() - start) * 1000)
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "%s %s -> %s (%sms)",
+            request.method,
+            request.url.path,
+            getattr(response, "status_code", "?"),
+            latency_ms,
+            extra={"request_id": request_id},
+        )
+        return response
+
     @app.get("/health")
     def health():
         return {"status": "ok", "service": "hookflow"}
+
+    @app.get("/metrics")
+    def metrics():
+        """Prometheus-text metrics. No dependency; scrape-ready exposition format."""
+        lines = [
+            "# HELP hookflow_events_ingested_total Accepted events (excluding dedupes).",
+            "# TYPE hookflow_events_ingested_total counter",
+            f"hookflow_events_ingested_total {_counters.get('events_ingested_total', 0)}",
+            "# HELP hookflow_events_deduplicated_total Idempotent replays returned without insert.",
+            "# TYPE hookflow_events_deduplicated_total counter",
+            f"hookflow_events_deduplicated_total {_counters.get('events_deduplicated_total', 0)}",
+            "# HELP hookflow_deliveries_requeued_total DLQ/manual requeues via replay endpoint.",
+            "# TYPE hookflow_deliveries_requeued_total counter",
+            f"hookflow_deliveries_requeued_total {_counters.get('deliveries_requeued_total', 0)}",
+        ]
+        return Response(content="\n".join(lines) + "\n", media_type="text/plain")
+
+    @app.get("/v1/stats")
+    def stats(db: Session = Depends(get_db)):
+        """Queue-depth + delivery-state overview for dashboards/alerts."""
+        rows = (
+            db.query(Delivery.status, func.count(Delivery.id))
+            .group_by(Delivery.status)
+            .all()
+        )
+        by_status = {status: count for status, count in rows}
+        queued = by_status.get("queued", 0) + by_status.get("retrying", 0)
+        return {
+            "by_status": by_status,
+            "queue_depth": queued,
+            "redis": "configured" if delivery_queue.has_redis else "not-configured",
+        }
 
     @app.get("/ready")
     def ready(db: Session = Depends(get_db)):
@@ -166,6 +237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 .first()
             )
             if existing is not None:
+                _bump("events_deduplicated_total")
                 delivery = (
                     db.query(Delivery)
                     .filter(Delivery.event_id == existing.id)
@@ -180,7 +252,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         event = Event(endpoint_id=endpoint.id, idempotency_key=key, payload=raw)
         db.add(event)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            # Lost the race: a concurrent ingest with the same
+            # (endpoint_id, idempotency_key) won. Return the winner instead
+            # of 500ing. This is why the UNIQUE constraint exists.
+            db.rollback()
+            winner = (
+                db.query(Event)
+                .filter(Event.endpoint_id == endpoint.id, Event.idempotency_key == key)
+                .order_by(Event.created_at)
+                .first()
+            )
+            if winner is None:  # pragma: no cover — defensive, should not happen
+                raise HTTPException(status_code=409, detail="idempotency conflict")
+            _bump("events_deduplicated_total")
+            delivery = (
+                db.query(Delivery)
+                .filter(Delivery.event_id == winner.id)
+                .order_by(Delivery.created_at)
+                .first()
+            )
+            return EventOut(
+                id=winner.id,
+                endpoint_id=endpoint.id,
+                delivery_id=delivery.id if delivery else "",
+                deduplicated=True,
+            )
         delivery = Delivery(
             event_id=event.id,
             endpoint_id=endpoint.id,
@@ -193,6 +292,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.refresh(event)
         db.refresh(delivery)
         delivery_queue.enqueue(delivery.id)
+        _bump("events_ingested_total")
         return EventOut(
             id=event.id,
             endpoint_id=endpoint.id,
@@ -235,6 +335,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             q = q.filter(Delivery.endpoint_id == endpoint_id)
         rows = q.order_by(Delivery.created_at.desc()).offset(offset).limit(limit).all()
         return {"items": [to_delivery_out(d).model_dump() for d in rows]}
+
+    @app.post("/v1/deliveries/{delivery_id}/requeue", response_model=DeliveryOut)
+    def requeue_delivery(delivery_id: str, db: Session = Depends(get_db)):
+        """Replay a dead-letter (or retrying/queued) delivery.
+
+        Resets attempts so the worker treats it as fresh. Only DLQ +
+        retrying + queued are requeueable — replaying a success would
+        duplicate a side effect at the receiver.
+        """
+        delivery = db.get(Delivery, delivery_id)
+        if delivery is None:
+            raise HTTPException(status_code=404, detail="delivery not found")
+        if delivery.status not in ("dlq", "retrying", "queued"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot requeue delivery in status {delivery.status!r}",
+            )
+        delivery.status = "queued"
+        delivery.attempts = 0
+        delivery.next_attempt_at = None
+        delivery.last_error = None
+        delivery.updated_at = utcnow()
+        db.add(delivery)
+        db.commit()
+        db.refresh(delivery)
+        delivery_queue.enqueue(delivery.id)
+        _bump("deliveries_requeued_total")
+        return to_delivery_out(delivery)
 
     return app
 
